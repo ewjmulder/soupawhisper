@@ -101,6 +101,23 @@ class Dictation:
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 print("Hint: Try setting device = cpu in your config, or install cuDNN.")
 
+    def notify(self, title, message, icon="dialog-information", timeout=2000):
+        """Send a desktop notification."""
+        if not NOTIFICATIONS:
+            return
+        subprocess.run(
+            [
+                "notify-send",
+                "-a", "SoupaWhisper",
+                "-i", icon,
+                "-t", str(timeout),
+                "-h", "string:x-canonical-private-synchronous:soupawhisper",
+                title,
+                message
+            ],
+            capture_output=True
+        )
+
     def start_recording(self):
         if self.recording or self.model_error:
             return
@@ -123,6 +140,8 @@ class Dictation:
             stderr=subprocess.DEVNULL
         )
         print("Recording...")
+        hotkey_name = HOTKEY.name if hasattr(HOTKEY, 'name') else HOTKEY.char
+        self.notify("Recording...", f"Release {hotkey_name.upper()} when done", "audio-input-microphone", 30000)
 
     def stop_recording(self):
         if not self.recording:
@@ -136,12 +155,14 @@ class Dictation:
             self.record_process = None
 
         print("Transcribing...")
+        self.notify("Transcribing...", "Processing your speech", "emblem-synchronizing", 30000)
 
         # Wait for model if not loaded yet
         self.model_loaded.wait()
 
         if self.model_error:
             print(f"Cannot transcribe: model failed to load")
+            self.notify("Error", "Model failed to load", "dialog-error", 3000)
             return
 
         # Transcribe
@@ -167,18 +188,14 @@ class Dictation:
                     subprocess.run(["xdotool", "type", "--clearmodifiers", text])
 
                 print(f"Copied: {text}")
-
-                # Send desktop notification
-                if NOTIFICATIONS:
-                    subprocess.run(
-                        ["notify-send", "SoupaWhisper", "Transcription copied"],
-                        capture_output=True
-                    )
+                self.notify("Copied!", text[:100] + ("..." if len(text) > 100 else ""), "emblem-ok-symbolic", 3000)
             else:
                 print("No speech detected")
+                self.notify("No speech detected", "Try speaking louder", "dialog-warning", 2000)
 
         except Exception as e:
             print(f"Error: {e}")
+            self.notify("Error", str(e)[:50], "dialog-error", 3000)
         finally:
             # Cleanup temp file
             if self.temp_file and os.path.exists(self.temp_file.name):
