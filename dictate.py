@@ -28,7 +28,7 @@ def load_config():
 
     # Defaults
     defaults = {
-        "model": "base.en",
+        "model_size": "base",
         "device": "cpu",
         "compute_type": "int8",
         "key": "f12",
@@ -39,11 +39,32 @@ def load_config():
     if CONFIG_PATH.exists():
         config.read(CONFIG_PATH)
 
+    model_size = config.get("whisper", "model_size", fallback=defaults["model_size"])
+
+    # Load language configurations
+    # Format: lang = hotkey
+    # Model is determined automatically: .en for English, multilingual for others
+    languages = {}
+    if config.has_section("languages"):
+        for lang, hotkey in config.items("languages"):
+            # Use .en model for English (faster/more accurate), multilingual for others
+            if lang == "en":
+                model = f"{model_size}.en"
+            else:
+                model = model_size
+            languages[lang] = {"key": hotkey.strip(), "model": model}
+    else:
+        # Backwards compatibility: use single hotkey with auto-detect
+        languages["auto"] = {
+            "key": config.get("hotkey", "key", fallback=defaults["key"]),
+            "model": model_size
+        }
+
     return {
-        "model": config.get("whisper", "model", fallback=defaults["model"]),
+        "model_size": model_size,
         "device": config.get("whisper", "device", fallback=defaults["device"]),
         "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
-        "key": config.get("hotkey", "key", fallback=defaults["key"]),
+        "languages": languages,
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
     }
@@ -64,8 +85,12 @@ def get_hotkey(key_name):
         return keyboard.Key.f12
 
 
-HOTKEY = get_hotkey(CONFIG["key"])
-MODEL_SIZE = CONFIG["model"]
+# Build hotkey-to-language mapping with model info
+HOTKEY_TO_LANG = {}
+for lang, lang_config in CONFIG["languages"].items():
+    hotkey = get_hotkey(lang_config["key"])
+    HOTKEY_TO_LANG[hotkey] = {"lang": lang, "model": lang_config["model"]}
+
 DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
 AUTO_TYPE = CONFIG["auto_type"]
@@ -77,29 +102,56 @@ class Dictation:
         self.recording = False
         self.record_process = None
         self.temp_file = None
-        self.model = None
-        self.model_loaded = threading.Event()
-        self.model_error = None
         self.running = True
+        self.active_language = None  # Track which language hotkey is pressed
+        self.active_model_name = None  # Track which model to use
 
-        # Load model in background
-        print(f"Loading Whisper model ({MODEL_SIZE})...")
-        threading.Thread(target=self._load_model, daemon=True).start()
+        # Model cache: model_name -> {"model": WhisperModel, "loaded": Event, "error": str|None}
+        self.models = {}
+        self.models_lock = threading.Lock()
 
-    def _load_model(self):
+        # Print configured hotkeys
+        print("Configured languages:")
+        for hotkey, config in HOTKEY_TO_LANG.items():
+            key_name = hotkey.name if hasattr(hotkey, 'name') else hotkey.char
+            lang = config["lang"]
+            model = config["model"]
+            lang_display = "auto-detect" if lang == "auto" else lang.upper()
+            print(f"  [{key_name}] → {lang_display} (model: {model})")
+        print("Models will be loaded on first use.")
+        print("Press Ctrl+C to quit.")
+
+    def _get_or_load_model(self, model_name):
+        """Get a model from cache or load it if not yet loaded."""
+        with self.models_lock:
+            if model_name not in self.models:
+                self.models[model_name] = {
+                    "model": None,
+                    "loaded": threading.Event(),
+                    "error": None
+                }
+                # Start loading in background
+                threading.Thread(
+                    target=self._load_model,
+                    args=(model_name,),
+                    daemon=True
+                ).start()
+        return self.models[model_name]
+
+    def _load_model(self, model_name):
+        """Load a specific model."""
+        model_info = self.models[model_name]
+        print(f"Loading Whisper model ({model_name})...")
         try:
-            self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-            self.model_loaded.set()
-            hotkey_name = HOTKEY.name if hasattr(HOTKEY, 'name') else HOTKEY.char
-            print(f"Model loaded. Ready for dictation!")
-            print(f"Hold [{hotkey_name}] to record, release to transcribe.")
-            print("Press Ctrl+C to quit.")
+            model_info["model"] = WhisperModel(model_name, device=DEVICE, compute_type=COMPUTE_TYPE)
+            print(f"Model {model_name} loaded.")
         except Exception as e:
-            self.model_error = str(e)
-            self.model_loaded.set()
-            print(f"Failed to load model: {e}")
+            model_info["error"] = str(e)
+            print(f"Failed to load model {model_name}: {e}")
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 print("Hint: Try setting device = cpu in your config, or install cuDNN.")
+        finally:
+            model_info["loaded"].set()
 
     def notify(self, title, message, icon="dialog-information", timeout=2000):
         """Send a desktop notification."""
@@ -118,11 +170,16 @@ class Dictation:
             capture_output=True
         )
 
-    def start_recording(self):
-        if self.recording or self.model_error:
+    def start_recording(self, language, model_name, hotkey):
+        if self.recording:
             return
 
+        # Start loading model if not yet loaded (non-blocking)
+        self._get_or_load_model(model_name)
+
         self.recording = True
+        self.active_language = language
+        self.active_model_name = model_name
         self.temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         self.temp_file.close()
 
@@ -139,9 +196,10 @@ class Dictation:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        print("Recording...")
-        hotkey_name = HOTKEY.name if hasattr(HOTKEY, 'name') else HOTKEY.char
-        self.notify("Recording...", f"Release {hotkey_name.upper()} when done", "audio-input-microphone", 30000)
+        lang_display = "auto-detect" if language == "auto" else language.upper()
+        hotkey_name = hotkey.name if hasattr(hotkey, 'name') else hotkey.char
+        print(f"Recording ({lang_display})...")
+        self.notify(f"Recording ({lang_display})...", f"Release {hotkey_name.upper()} when done", "audio-input-microphone", 30000)
 
     def stop_recording(self):
         if not self.recording:
@@ -157,20 +215,31 @@ class Dictation:
         print("Transcribing...")
         self.notify("Transcribing...", "Processing your speech", "emblem-synchronizing", 30000)
 
-        # Wait for model if not loaded yet
-        self.model_loaded.wait()
+        # Get the model for this language
+        model_info = self._get_or_load_model(self.active_model_name)
 
-        if self.model_error:
+        # Wait for model if not loaded yet
+        model_info["loaded"].wait()
+
+        if model_info["error"]:
             print(f"Cannot transcribe: model failed to load")
             self.notify("Error", "Model failed to load", "dialog-error", 3000)
             return
 
-        # Transcribe
+        # Transcribe with language setting
         try:
-            segments, info = self.model.transcribe(
+            transcribe_kwargs = {
+                "beam_size": 5,
+                "vad_filter": True,
+            }
+            # Only set language if not auto-detect and not using a .en model
+            if self.active_language and self.active_language != "auto":
+                if not self.active_model_name.endswith(".en"):
+                    transcribe_kwargs["language"] = self.active_language
+
+            segments, info = model_info["model"].transcribe(
                 self.temp_file.name,
-                beam_size=5,
-                vad_filter=True,
+                **transcribe_kwargs,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
@@ -202,11 +271,12 @@ class Dictation:
                 os.unlink(self.temp_file.name)
 
     def on_press(self, key):
-        if key == HOTKEY:
-            self.start_recording()
+        if key in HOTKEY_TO_LANG:
+            config = HOTKEY_TO_LANG[key]
+            self.start_recording(config["lang"], config["model"], key)
 
     def on_release(self, key):
-        if key == HOTKEY:
+        if key in HOTKEY_TO_LANG and self.recording:
             self.stop_recording()
 
     def stop(self):

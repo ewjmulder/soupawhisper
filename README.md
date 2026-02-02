@@ -70,9 +70,25 @@ compute_type = float16
 poetry run python dictate.py
 ```
 
-- Hold **F12** to record
+- Hold a configured hotkey to record (default: **F12**)
 - Release to transcribe → copies to clipboard and types into active input
 - Press **Ctrl+C** to quit (when running manually)
+
+### Multi-Language Dictation
+
+SoupaWhisper supports multiple languages with different hotkeys:
+
+```ini
+[whisper]
+model_size = small    # Used for all languages
+
+[languages]
+en = f12    # English → automatically uses small.en
+nl = f11    # Dutch → automatically uses small (multilingual)
+de = f10    # German → automatically uses small (multilingual)
+```
+
+The `.en` model variant is automatically selected for English (faster and more accurate). Models are loaded on first use.
 
 ## Run as a systemd Service
 
@@ -98,8 +114,9 @@ Edit `~/.config/soupawhisper/config.ini`:
 
 ```ini
 [whisper]
-# Model size: tiny.en, base.en, small.en, medium.en, large-v3
-model = base.en
+# Model size: tiny, base, small, medium, large-v3
+# English automatically uses .en variant (e.g., small → small.en)
+model_size = small
 
 # Device: cpu or cuda (cuda requires cuDNN)
 device = cpu
@@ -107,15 +124,16 @@ device = cpu
 # Compute type: int8 for CPU, float16 for GPU
 compute_type = int8
 
-[hotkey]
-# Key to hold for recording: f12, scroll_lock, pause, etc.
-key = f12
+[languages]
+# Format: language_code = hotkey
+en = f12
+nl = f11
 
 [behavior]
 # Type text into active input field
 auto_type = true
 
-# Show desktop notification
+# Show desktop notifications
 notifications = true
 ```
 
@@ -150,12 +168,15 @@ Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
 
 ## Model Sizes
 
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| tiny.en | ~75MB | Fastest | Basic |
-| base.en | ~150MB | Fast | Good |
-| small.en | ~500MB | Medium | Better |
-| medium.en | ~1.5GB | Slower | Great |
-| large-v3 | ~3GB | Slowest | Best |
+| model_size | Size | Speed | Notes |
+|------------|------|-------|-------|
+| tiny | ~75MB | Fastest | Basic accuracy |
+| base | ~150MB | Fast | Good for most use |
+| small | ~500MB | Medium | Better accuracy |
+| medium | ~1.5GB | Slower | High accuracy |
+| large-v3 | ~3GB | Slowest | Best accuracy |
 
-For dictation, `base.en` or `small.en` is usually the sweet spot.
+- English automatically uses the `.en` variant (faster and more accurate)
+- Other languages use the multilingual model with language hint
+- Models are loaded lazily - only used models consume memory
+- **Recommended**: `small` for good balance of speed and accuracy
